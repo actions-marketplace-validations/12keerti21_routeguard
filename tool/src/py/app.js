@@ -21,10 +21,12 @@ export function pyAppRules(routes) {
 	let firstApp = null
 	const at = (file, node) => `${path.relative(root, file)}:${lineOf(node)}`
 	const djangoAllOrigins = []
+	const hardSecrets = []
+	const secretReplaced = new Set()
 	let djangoCredentials = false
 	const ofApp = new Set(routes.map(r => path.join(root, r.file)))
 	// settings for tests, local development and project templates are not what runs in production
-	const devFile = file => /(^|[\/_.-])(dev|development|local|test|tests|testing|ci|example|sample|template|project_template)([\/_.-]|$)/i.test(path.relative(root, file))
+	const devFile = file => /(^|[\/_.-])(dev|development|local|test|tests|testing|ci|e2e|example|sample|template|project_template)([\/_.-]|$)/i.test(path.relative(root, file))
 	const devClass = node => {
 		for (let n = node.parent; n; n = n.parent) if (n.type === "class_definition") return /Test|Dev|Local|Debug|Example/.test(field(n, "name").text)
 		return false
@@ -48,18 +50,22 @@ export function pyAppRules(routes) {
 				if (!name || !right) return
 				const dev = devFile(file) || devClass(n)
 				if ((SECRET_SETTING.test(name) || name === "secret_key") && right.type === "string" && (pyString(right) ?? "").length >= 4 && !/^(change|replace|your|xxx|<)/i.test(pyString(right) ?? ""))
-					out.push(dev ? { ...finding("JWT", "API2:2023 Broken Authentication", "HIGH", at(file, n), `${name} is written in the code, so anyone with the source can sign sessions and tokens.`, "Read the key from the environment or a secret store, with no default."), devSettings: true } : finding("JWT", "API2:2023 Broken Authentication", "HIGH", at(file, n), `${name} is written in the code, so anyone with the source can sign sessions and tokens.`, "Read the key from the environment or a secret store, with no default."))
+					hardSecrets.push({ name, dir: path.dirname(file), finding: { ...finding("JWT", "API2:2023 Broken Authentication", "HIGH", at(file, n), `${name} is written in the code, so anyone with the source can sign sessions and tokens.`, "Read the key from the environment or a secret store, with no default."), devSettings: dev } })
+				// prod.py: SECRET_KEY = read_secret() replaces the one in base.py
+				if (SECRET_SETTING.test(name) && right.type !== "string" && !dev) secretReplaced.add(`${path.dirname(file)}#${name}`)
 				// os.environ.get("SECRET_KEY", "dev-secret")
 				// getattr(obj, "SECRET_KEY", default): the default is the third argument there, the second elsewhere
 				const fallback = right.type === "call" ? (callName(right) === "getattr" ? posArgs(right)[2] : posArgs(right)[1]) ?? kwarg(right, "default") : null
 				if (SECRET_SETTING.test(name) && right.type === "call" && /environ|getenv|config|env\(|getattr/.test(right.text) && fallback?.type === "string" && (pyString(fallback) ?? "").length >= 4)
-					out.push(finding("JWT", "API2:2023 Broken Authentication", "MEDIUM", at(file, n), `${name} falls back to a key written in the code when the environment does not set one.`, "Fail at start-up when the key is missing instead of using a default."))
+					out.push(dev ? { ...finding("JWT", "API2:2023 Broken Authentication", "MEDIUM", at(file, n), `${name} falls back to a key written in the code when the environment does not set one.`, "Fail at start-up when the key is missing instead of using a default."), devSettings: true } : finding("JWT", "API2:2023 Broken Authentication", "MEDIUM", at(file, n), `${name} falls back to a key written in the code when the environment does not set one.`, "Fail at start-up when the key is missing instead of using a default."))
 				if (name === "DEBUG" && isTrue(right) && /settings|config/i.test(file))
 					out.push(dev ? { ...finding("ERROR_LEAK", "API8:2023 Security Misconfiguration", "MEDIUM", at(file, n), "DEBUG = True in the settings: errors show stack traces, settings and SQL to anyone.", "Read DEBUG from the environment and keep it off in production."), devSettings: true } : finding("ERROR_LEAK", "API8:2023 Security Misconfiguration", "MEDIUM", at(file, n), "DEBUG = True in the settings: errors show stack traces, settings and SQL to anyone.", "Read DEBUG from the environment and keep it off in production."))
 				if (/^(CORS_ALLOW_ALL_ORIGINS|CORS_ORIGIN_ALLOW_ALL)$/.test(name) && isTrue(right)) djangoAllOrigins.push({ file, n })
 				if (name === "CORS_ALLOW_CREDENTIALS" && isTrue(right)) djangoCredentials = true
 				// response.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin")
-				if (name === "Access-Control-Allow-Origin" && /Origin|origin/.test(right.text) && right.type !== "string") {
+				// origin not in settings.ALLOWED_ORIGINS: return response — an allow-list in front of the echo
+				const allowListed = /\borigin\b[^\n]*\b(not\s+)?in\b|in_allowlist|allowed/i.test(enclosingFunction(n)?.text ?? "")
+				if (name === "Access-Control-Allow-Origin" && /Origin|origin/.test(right.text) && right.type !== "string" && !allowListed) {
 					const credentials = /Access-Control-Allow-Credentials['"]\]\s*=\s*['"]true/i.test(enclosingFunction(n)?.text ?? "")
 					out.push(finding("CORS", "API8:2023 Security Misconfiguration", credentials ? "HIGH" : "LOW", at(file, n), `Access-Control-Allow-Origin is copied from the request${credentials ? ", with Allow-Credentials true, so any website can act as the signed-in user" : ""}.`, "Compare the Origin against an allow-list before echoing it."))
 				}
@@ -90,6 +96,8 @@ export function pyAppRules(routes) {
 			// JWT
 			if (name === "decode" && /jwt/.test(callObject(n)?.text ?? "")) {
 				const options = kwarg(n, "options")?.text ?? ""
+				// is_jwt_formatted(): a result nobody reads decides nothing
+				if (n.parent?.type === "expression_statement") return
 				if (/verify_signature['"]\s*:\s*False/.test(options) || kwarg(n, "verify")?.type === "false")
 					out.push(finding("JWT", "API2:2023 Broken Authentication", "HIGH", at(file, n), "jwt.decode() does not check the signature, so anyone can forge a token.", "Verify the signature: pass the key and algorithms=[...]."))
 				else if (/["']none["']/i.test(kwarg(n, "algorithms")?.text ?? ""))
@@ -115,6 +123,8 @@ export function pyAppRules(routes) {
 			out.push(finding("ERROR_LEAK", "API8:2023 Security Misconfiguration", "LOW", at(file, firstRaw), `${rawErrors} responses in this file send str(exception) to the client, which can carry query details, driver messages and paths.`, "Log the exception and send a generic message with a status code."))
 		out.push(...consumption(file, rootNode, at))
 	}
+	for (const { name, dir, finding: f } of hardSecrets)
+		out.push(secretReplaced.has(`${dir}#${name}`) ? { ...f, severity: "LOW", message: `${f.message} Another settings file here sets it from elsewhere, so this one is likely a development default.`, devSettings: false } : f)
 	for (const { file, n } of djangoAllOrigins)
 		out.push(finding("CORS", "API8:2023 Security Misconfiguration", djangoCredentials ? "HIGH" : "LOW", at(file, n), djangoCredentials ? "django-cors-headers allows every origin with credentials, so any website can make signed-in requests and read the answers." : "django-cors-headers allows every origin. Fine for a public, token-only API.", "List the allowed origins in CORS_ALLOWED_ORIGINS."))
 	if (!secureHeaders && firstApp)

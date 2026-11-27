@@ -13,12 +13,14 @@ const FRAMEWORKS = [
 	["chi", /github\.com\/go-chi\/chi(\/v\d+)?$/],
 	["mux", /github\.com\/gorilla\/mux$/],
 	["httprouter", /github\.com\/julienschmidt\/httprouter$/],
+	["flamego", /github\.com\/flamego\/flamego$/],
+	["macaron", /(gopkg\.in\/macaron\.v1|github\.com\/go-macaron\/macaron)$/],
 	["net/http", /^net\/http$/]
 ]
-const CONSTRUCTOR = /^(gin\.(Default|New)|echo\.New\w*|fiber\.New|chi\.New\w*|mux\.NewRouter|http\.NewServeMux|httprouter\.New|web\.New\w*)$/
+const CONSTRUCTOR = /^(gin\.(Default|New)|echo\.New\w*|fiber\.New|chi\.New\w*|mux\.NewRouter|http\.NewServeMux|httprouter\.New|web\.New\w*|flamego\.(New|Classic)|macaron\.(New|Classic))$/
 // parameter types that carry a router into a function
-const ROUTER_TYPE = /^\*?(gin\.(Engine|RouterGroup|IRouter|IRoutes)|echo\.(Echo|Group)|fiber\.(App|Router|Group)|chi\.(Router|Mux)|mux\.Router|http\.ServeMux|httprouter\.Router)$/
-const RETURNS_ROUTER = /gin\.Engine|RouterGroup|echo\.Echo|echo\.Group|fiber\.App|fiber\.Router|chi\.Mux|chi\.Router|mux\.Router|http\.ServeMux|httprouter\.Router|http\.Handler\b/
+const ROUTER_TYPE = /^\*?(gin\.(Engine|RouterGroup|IRouter|IRoutes)|echo\.(Echo|Group)|fiber\.(App|Router|Group)|chi\.(Router|Mux)|mux\.Router|http\.ServeMux|httprouter\.Router|flamego\.(Flame|Router)|macaron\.(Macaron|Router)|router\.(Router|RouterGroup)(\[.*\])?)$/
+const RETURNS_ROUTER = /gin\.Engine|RouterGroup|echo\.Echo|echo\.Group|fiber\.App|fiber\.Router|chi\.Mux|chi\.Router|mux\.Router|http\.ServeMux|httprouter\.Router|flamego\.Flame|macaron\.Macaron|http\.Handler\b/
 const VERB = { GET: "GET", POST: "POST", PUT: "PUT", PATCH: "PATCH", DELETE: "DELETE", HEAD: "HEAD", OPTIONS: "OPTIONS" }
 const ANY = /^(Any|All)$/
 // methods that take the HTTP method as their first argument
@@ -31,15 +33,17 @@ const ADAPTER = /^(http\.HandlerFunc|http\.Handler|gin\.WrapH|gin\.WrapF|echo\.W
 
 // middleware that runs on a route but enforces nothing about who is calling
 const NOT_ENFORCED = /optional|maybe|soft|limit|throttle|logger|logging|recover|cors|gzip|compress|request_?id|timeout|metrics|prometheus|static|nocache|real_?ip|tracing|otel|sentry|LoadAndSave|Sessions$|csrf|secure$|bodylimit|decompress|i18n|locale/i
+const OPTIONAL = /optional|maybe|soft|skips GET/i
 const AUTH_NAME = /auth|jwt|token|login|logged|signed|sign_?in|protect|guard|bearer|api_?key|oauth|oidc|keycloak|require_?user|current_?user|basic_?auth|key_?auth|session/i
 // reqRepoWriter, mustBeOrgMember, ensureTeamAccess: a check on the caller's rights to something
 const ROLE_NAME = /admin|role|permission|rbac|acl|casbin|privilege|scope|owner|staff|superuser|can[A-Z]|is_?(admin|staff|owner)|require_?(admin|role|permission|owner|staff)|^(req|require|must|ensure|check)_?\w*(writer|reader|member|membership|access|collaborator|maintainer|manager|team|ownership)|^(req|require|must|ensure|check)_?(read|write|pull|push|edit|view|manage)\b|^Must(Pull|Push|Read|Write|Edit|View|Manage)|local_?only|internal_?only|APILocal|localhost_?only|auth_?internal|internal_?(auth|token)|service_?token/i
 // what a middleware's own code shows when its name says nothing
-const AUTH_BODY = /Authorization|Bearer|ParseWithClaims|jwt\.Parse|StatusUnauthorized|ErrUnauthorized|\b401\b|Cookie\(/
+const AUTH_BODY = /Authorization|Bearer|BasicAuth\(|DecodeBasic\(|ConstantTimeCompare\(|ParseWithClaims|jwt\.Parse|StatusUnauthorized|ErrUnauthorized|\b401\b|Cookie\(/
 const ROLE_BODY = /StatusForbidden|ErrForbidden|\b403\b|IsAdmin|\.Role\b|Permission/
 
 export function classifyGo(names) {
-	const enforced = names.filter(n => !NOT_ENFORCED.test(n))
+	// app.MetricsFilter whose body checks basic auth still guards the route
+	const enforced = names.filter(n => !NOT_ENFORCED.test(n) || (/ \(checks(Auth|Role)\)$/.test(n) && !OPTIONAL.test(n)))
 	// session.MustOrgMember: the package says little, the function name decides
 	const lasts = enforced.map(n => n.replace(/\(.*$/, "").split(".").at(-1))
 	const { auth, role } = classify(enforced)
@@ -202,7 +206,7 @@ export async function mapGoRoutes(root) {
 		const router = object ? routerOf(object, local, info, file, depth) : null
 		const a = args(call)
 		// Use, Echo's Pre, Gitea's AfterRouting: middleware for every route on the router
-		if (router && /^(Use|Pre|AfterRouting|BeforeRouting|UseMiddleware)$/.test(name)) {
+		if (router && /^(Use|Pre|AfterRouting|BeforeRouting|UseMiddleware|Bind|BindFunc)$/.test(name)) {
 			router.mw.push(...a.map(m => middlewareName(m, local, info)))
 			return false
 		}
@@ -319,6 +323,11 @@ export async function mapGoRoutes(root) {
 				const child = makeRouter(parent, stringValue(a[0], ctx.consts) ?? `<${exprName(a[0])}>`)
 				child.mw.push(...a.slice(1).map(m => middlewareName(m, local, info)))
 				return child
+			}
+			// rg.Group("/settings").Bind(RequireSuperuserAuth()): the chain returns the group itself
+			if (/^(Bind|BindFunc)$/.test(name)) {
+				parent.mw.push(...a.map(m => middlewareName(m, local, info)))
+				return parent
 			}
 			if (name === "With") {
 				const child = makeRouter(parent, "")
@@ -438,12 +447,24 @@ export async function mapGoRoutes(root) {
 		// Echo takes the handler first and middleware after; the others take the handler last
 		const echoStyle = info.frameworks.includes("echo") && !info.frameworks.includes("gin") && !info.frameworks.includes("fiber")
 		const handlerExpr = echoStyle ? handlers[0] : handlers.at(-1)
-		const routeMw = (echoStyle ? handlers.slice(1) : handlers.slice(0, -1)).map(m => middlewareName(m, local, info))
+		const routeMw = [...(echoStyle ? handlers.slice(1) : handlers.slice(0, -1)), ...bindChain(call)].map(m => middlewareName(m, local, info))
 		const { fn, wrappers, name: handlerName } = unwrapHandler(handlerExpr, local, info)
 		const key = `${file}:${lineOf(call)}:${method}`
 		if (!sites.has(key)) sites.set(key, [])
 		sites.get(key).push({ entry: entryKey, conditional: settingGuard(call, guardOfCallers), router, raw, method, mwAt: router.frozen ? fullMw(router) : null, mw: [...routeMw, ...wrappers], fn, handlerName, file, line: lineOf(call), framework: info.frameworks[0] ?? "net/http" })
 		return true
+	}
+
+	// PocketBase: sub.GET("", h).Bind(RequireSuperuserAuth())
+	function bindChain(call) {
+		const out = []
+		let node = call
+		while (node.parent?.type === "selector_expression" && node.parent.parent?.type === "call_expression") {
+			const outer = node.parent.parent
+			if (/^(Bind|BindFunc)$/.test(calleeName(outer))) out.push(...args(outer))
+			node = outer
+		}
+		return out
 	}
 
 	// gorilla/mux: r.HandleFunc("/x", h).Methods("GET", "POST")
@@ -478,7 +499,7 @@ export async function mapGoRoutes(root) {
 		// JWTWithConfig({Skipper: ... GET ...}): reads are let through
 		if (expr?.type === "call_expression" && /Skipper/.test(expr.text) && /MethodGet|"GET"/.test(expr.text)) name += "(skips GET)"
 		const { auth } = classifyGo([name])
-		if (auth || NOT_ENFORCED.test(name)) return name
+		if (auth || OPTIONAL.test(name)) return name
 		const target = expr ? resolveCall(expr.type === "call_expression" ? expr : { fake: expr }, local, info)[0] : null
 		const hint = target ? bodyHint(target.node.text) : null
 		return hint ? `${name} (${hint})` : name
@@ -543,7 +564,7 @@ export async function mapGoRoutes(root) {
 		if (!fnExpr) return []
 		return resolveName(fnExpr, local, info, handlersOnly, call.fake ? null : args(call).length)
 	}
-	function resolveName(fnExpr, local, info, handlersOnly, arity) {
+	function resolveName(fnExpr, local, info, handlersOnly, arity, typedOnly = false) {
 		const isHandler = t => paramsOf(t.node).some(p => HANDLER_PARAM.test(p.type))
 		const filter = list => (handlersOnly ? list.filter(isHandler) : list)
 		if (fnExpr.type === "identifier") {
@@ -560,14 +581,31 @@ export async function mapGoRoutes(root) {
 			return target ? filter([target]) : []
 		}
 		const candidates = filter(methods.get(name) ?? [])
-		if (candidates.length <= 1) return candidates
-		const type = local.types.get(operand.text) ?? local.types.get(operand.text.split(".").at(-1))
-		const typed = type ? candidates.filter(c => c.recv === baseType(type)) : []
+		if (candidates.length <= 1 && !typedOnly) return candidates
+		// db.Passkeys().DeleteByID(...): the receiver's type is what Passkeys() returns
+		const type = (operand.type === "call_expression" ? typeOf(operand, local, info) : null) ?? local.types.get(operand.text) ?? local.types.get(operand.text.split(".").at(-1))
+		// api.playlists.Delete: the type of the struct field
+		const fieldType = !type && operand.type === "selector_expression" ? fieldTypeOf(operand, local, info) : null
+		const want = type ?? fieldType
+		const typed = want ? candidates.filter(c => c.recv === baseType(want)) : []
 		if (typed.length) return typed
+		// an interface Playlists is usually implemented by a struct playlists in its package
+		const impl = want ? candidates.filter(c => c.recv.toLowerCase() === baseType(want).toLowerCase()) : []
+		if (impl.length) return impl
+		if (typedOnly) return []
 		const sameDir = candidates.filter(c => c.dir === info.dir)
 		if (sameDir.length === 1) return sameDir
 		const sized = arity === null ? candidates : candidates.filter(c => paramsOf(c.node).length === arity)
 		return sized.slice(0, 4)
+	}
+
+	function fieldTypeOf(selector, local, info) {
+		const owner = field(selector, "operand")
+		const ownerType = owner?.type === "identifier" ? local.types.get(owner.text) : null
+		if (!ownerType) return null
+		const name = field(selector, "field").text
+		const struct = (types.get(baseType(ownerType)) ?? []).find(t => t.dir === info.dir) ?? (types.get(baseType(ownerType)) ?? [])[0]
+		return struct?.fields.find(f => f.name === name)?.type ?? null
 	}
 
 	function typeOf(expr, local, info) {
@@ -585,6 +623,11 @@ export async function mapGoRoutes(root) {
 
 	ctx.resolveName = (fnExpr, local, file) => resolveName(fnExpr, local, { ...fileInfo.get(file), file }, false, null)
 	ctx.resolveCall = (call, local, file) => resolveCall(call, local, { ...fileInfo.get(file), file })
+	// only a method whose receiver type is known: api.playlists.Delete, not db.Delete
+	ctx.resolveTyped = (call, local, file) => {
+		const fnExpr = field(call, "function")
+		return fnExpr?.type === "selector_expression" ? resolveName(fnExpr, local, { ...fileInfo.get(file), file }, false, args(call).length, true) : []
+	}
 	ctx.typeOf = (expr, local, file) => typeOf(expr, local, { ...fileInfo.get(file), file })
 	// the struct a type name means from this file: models.User through the import, User in this package
 	ctx.structOf = (typeText, file) => {

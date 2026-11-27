@@ -226,3 +226,49 @@ these apps use to stay safe: DRF querysets restricted in a base view, repositori
 object permission classes, signed badge links and settings-guarded debug views. Scanning the ten apps
 (2,081 Python routes across all fourteen targets) takes about 8 seconds.
 
+
+## 7. Nine more open-source APIs
+
+Nine apps not used while building routeguard, scanned with 2.1.0 and read by hand. 2.1.0 reported
+about 60 HIGH findings across them; every one was a routeguard false positive, and 2.1.1 fixes them.
+
+| App | Language | Routes | HIGH | MEDIUM | LOW |
+|---|---|---|---|---|---|
+| [n8n](https://github.com/n8n-io/n8n) | TypeScript (decorator controllers) | 1,106 | 8 | 14 | 31 |
+| [Baserow](https://github.com/baserow/baserow) | Python (DRF) | 807 | 0 | 16 | 18 |
+| [Plane](https://github.com/makeplane/plane) | Python (DRF) | 712 | 0 | 19 | 10 |
+| [Label Studio](https://github.com/HumanSignal/label-studio) | Python (DRF) | 297 | 0 | 0 | 1 |
+| [Gogs](https://github.com/gogs/gogs) | Go (flamego) | 277 | 0 | 9 | 68 |
+| [Navidrome](https://github.com/navidrome/navidrome) | Go (chi) | 179 | 0 | 3 | 55 |
+| [linkding](https://github.com/sissbruecker/linkding) | Python (Django) | 68 | 0 | 0 | 2 |
+| [PocketBase](https://github.com/pocketbase/pocketbase) | Go | 54 | 0 | 0 | 11 |
+| [Parse Server](https://github.com/parse-community/parse-server) | JavaScript | 5 | 0 | 0 | 1 |
+
+What 2.1.0 got wrong, and 2.1.1 now handles:
+
+- Go: flamego and macaron routers, PocketBase's own router, method calls resolved by receiver and
+  struct field type (so an app's `store.GetByID` is followed, not taken as a raw database read),
+  optional auth middleware.
+- Python: a hard-coded `SECRET_KEY` replaced by a production settings file, a discarded
+  `jwt.decode`, CORS with an origin allow-list, ownership checks delegated to helpers.
+- Express: client calls in promise chains (`return api.get(...)`) read as routes, CORS set up only
+  in development code.
+- All languages: health and version probes, `GET /metrics` (now MEDIUM), writes keyed only by UUIDs
+  (now MEDIUM).
+
+Since then routeguard also reads decorator controllers (NestJS `@Controller`, routing-controllers,
+n8n's `@RestController`, with `@Param`, `@CurrentUser`, `@UseGuards`, `@Public` and global guards)
+and Django urlconfs built from splatted lists, reassigned `urlpatterns` and `decorate_urlpatterns`.
+That took n8n from 49 to 1,106 routes, Plane from 63 to 712 and linkding from 2 to 68.
+
+n8n's 8 HIGHs: `GET /rest/debug/multi-main-setup` skips auth on purpose and is worth a look; the
+two dynamic-credential BOLAs are false positives (a middleware checks a token, but its name does not
+say so); the five BFLAs come from route names (`/agents/system`, `/gateway/config`) and are
+arguable. Most remaining MEDIUMs are login, reset and verification routes with no rate limit, which these apps
+may limit at the proxy. The Navidrome BOLAs are false positives: the ownership check sits behind a
+repository interface routeguard does not follow. The Gogs BOLAs and BFLAs are not yet confirmed
+either way.
+
+**Coverage gaps.** Parse Server registers its routes through its own router classes, so only 5 are
+mapped, and PocketBase routes lack their `/api` prefix. Findings on those two apps cover only the
+routes routeguard maps.

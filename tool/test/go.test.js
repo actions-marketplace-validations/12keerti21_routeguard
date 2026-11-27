@@ -96,6 +96,27 @@ test("net/http: method patterns, wrapped handlers and a wrapped mux", async () =
 	assert.ok(findings.some(f => f.rule === "ERROR_LEAK" && f.severity === "MEDIUM"))
 })
 
+test("flamego: groups with trailing middleware, receivers typed through calls and fields, and checks in middleware bodies", async () => {
+	const { byRoute, findings, has } = await scan("flamego")
+	assert.equal(byRoute.get("DELETE /api/notes/{id}").auth, true, "f.Group(prefix, fn, requireAuthenticated)")
+	assert.equal(byRoute.get("GET /-/metrics").auth, true, "MetricsFilter checks basic auth in its body")
+	assert.ok(!has("BFLA", "GET /-/metrics"))
+	assert.ok(!has("BOLA", "DELETE /api/passkeys/{id}"), "db.Passkeys() returns *PasskeysStore, whose DeleteByID takes the caller")
+	assert.ok(findings.some(f => f.rule === "BOLA" && f.route === "DELETE /api/notes/{id}" && f.severity === "HIGH"))
+	assert.ok(findings.some(f => f.rule === "BOLA" && f.route === "DELETE /api/uploads/{uuid}" && f.severity === "MEDIUM"), "a random UUID is hard to reach")
+	assert.ok(!has("BOLA", "DELETE /api/playlists/{id}"), "the playlists struct behind the Playlists interface compares the owner")
+	const unverified = findings.filter(f => f.rule === "JWT").map(f => f.severity).sort()
+	assert.deepEqual(unverified, ["LOW", "MEDIUM"], "reading the kid is a step before verification; reading claims is not")
+})
+
+test("PocketBase-style router: Bind on a group and on a single route", async () => {
+	const { byRoute, findings } = await scan("pbrouter")
+	assert.equal(byRoute.get("GET /settings").role, true, "rg.Group(\"/settings\").Bind(RequireSuperuserAuth())")
+	assert.equal(byRoute.get("GET /backups").role, true, "rg.GET(...).Bind(RequireSuperuserAuth())")
+	assert.equal(byRoute.get("GET /health").auth, false)
+	assert.ok(findings.every(f => f.severity !== "HIGH"))
+})
+
 test("a directory with no Go files maps no Go routes", async () => {
 	const routes = await mapGoRoutes(new URL("./fixtures/app", import.meta.url).pathname)
 	assert.equal(routes.length, 0)

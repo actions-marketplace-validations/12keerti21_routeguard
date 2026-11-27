@@ -1,4 +1,5 @@
 import path from "node:path"
+import { readFileSync } from "node:fs"
 import { listSourceFiles, parseFile, walk, isCallNode, isMemberNode } from "../mapper.js"
 import { calleeName, calleeObject } from "./handler.js"
 
@@ -11,6 +12,8 @@ const SECURITY_HEADERS = /^(helmet|lusca|xssProtection|hidePoweredBy|frameguard|
 const prop = (object, key) =>
 	object?.type === "ObjectExpression" ? object.properties.find(p => (p.key?.name ?? p.key?.value) === key)?.value : undefined
 const stringsIn = node => (node?.type === "ArrayExpression" ? node.elements.filter(e => e?.type === "StringLiteral").map(e => e.value) : [])
+// inDevelopment, isDev, setupDevMiddlewares, NODE_ENV === "development"; not device
+const DEV_TEST = /(dev|Dev|DEV)(elop\w*|ELOP\w*)?(?![a-z])|NODE_ENV/
 const isTrue = node => node?.type === "BooleanLiteral" && node.value
 
 // reflects the caller's origin: origin: true, origin: "*", or (origin, cb) => cb(null, true)
@@ -37,6 +40,9 @@ export function misconfig(root) {
 	const findings = []
 	let createsApp = null
 	let hasSecurityHeaders = false
+	// where each name is used, in dev-only code or not: a CORS middleware wired up only in development is not a production risk
+	const uses = new Map()
+	const corsGroups = []
 	const add = (file, node, finding) =>
 		findings.push({ ...finding, route: "(app-wide)", where: `${path.relative(root, file)}:${node.loc.start.line}` })
 
@@ -51,7 +57,33 @@ export function misconfig(root) {
 
 		// the walk visits a function before its body, so this stack holds the nearest one
 		const enclosing = []
+		const source = readFileSync(file, "utf8")
+		const fnNames = new Map()
+		const devBlocks = []
+		const declared = new Set()
+		const inside = (outer, n) => outer.start <= n.start && n.end <= outer.end
 		walk(ast, n => {
+			if (n.type === "VariableDeclarator" && n.id.type === "Identifier") {
+				declared.add(n.id)
+				if (n.init && FUNCTION.test(n.init.type)) fnNames.set(n.init, n.id.name)
+			}
+			if (/Specifier$/.test(n.type)) for (const k of ["local", "exported", "imported"]) if (n[k]) declared.add(n[k])
+			// const { corsMiddleware } = require("./cors"): a declaration, not a use
+			if (n.type === "VariableDeclarator" && n.id.type === "ObjectPattern") for (const p of n.id.properties) declared.add(p.key).add(p.value)
+			// exports.corsMiddleware = (req, res, next) => {}
+			if (n.type === "AssignmentExpression" && isMemberNode(n.left) && n.right && FUNCTION.test(n.right.type)) {
+				fnNames.set(n.right, n.left.property?.name)
+				declared.add(n.left.property)
+			}
+			if (n.type === "FunctionDeclaration" && n.id) declared.add(n.id)
+			const test = n.type === "IfStatement" || n.type === "ConditionalExpression" ? n.test : n.type === "LogicalExpression" && n.operator === "&&" ? n.left : null
+			if (test && DEV_TEST.test(source.slice(test.start, test.end))) devBlocks.push(n.type === "LogicalExpression" ? n.right : n.consequent)
+			if (n.type === "Identifier" && !declared.has(n)) {
+				const dev = devBlocks.some(b => inside(b, n)) || enclosing.some(f => inside(f, n) && DEV_TEST.test(fnNames.get(f) ?? f.id?.name ?? f.key?.name ?? ""))
+				const count = uses.get(n.name) ?? { dev: 0, other: 0 }
+				count[dev ? "dev" : "other"]++
+				uses.set(n.name, count)
+			}
 			if (FUNCTION.test(n.type)) {
 				while (enclosing.length && !(enclosing.at(-1).start <= n.start && n.end <= enclosing.at(-1).end)) enclosing.pop()
 				enclosing.push(n)
@@ -171,13 +203,15 @@ export function misconfig(root) {
 			}
 		})
 
-		for (const { wildcard, credentials } of corsByFunction.values()) {
+		for (const [fn, { wildcard, credentials }] of corsByFunction.entries()) {
 			if (!wildcard) continue
+			corsGroups.push({ name: fnNames.get(fn) ?? fn.id?.name ?? fn.key?.name, index: findings.length })
 			add(file, wildcard.node, {
 				rule: "CORS",
 				owasp: "API8:2023 Security Misconfiguration",
-				severity: credentials ? "HIGH" : "LOW",
-				message: `Access-Control-Allow-Origin is ${wildcard.reflected ? "copied from the request" : "*"}${credentials ? ", with Allow-Credentials true, so any website can act as the signed-in user" : ""}.`,
+				// browsers refuse * together with credentials, so only a reflected origin lets a site act as the user
+				severity: credentials && wildcard.reflected ? "HIGH" : "LOW",
+				message: `Access-Control-Allow-Origin is ${wildcard.reflected ? "copied from the request" : "*"}${credentials ? (wildcard.reflected ? ", with Allow-Credentials true, so any website can act as the signed-in user" : ", with Allow-Credentials true, which browsers refuse; drop one of the two") : ""}.`,
 				fix: "Answer only the origins you trust."
 			})
 		}
@@ -200,6 +234,11 @@ export function misconfig(root) {
 			message: "No helmet() or equivalent: no HSTS, nosniff or frame protection, and X-Powered-By names the framework.",
 			fix: "app.use(helmet()), or at least app.disable('x-powered-by') and the headers your clients need."
 		})
+	}
+	for (const { name, index } of corsGroups) {
+		const count = name && uses.get(name)
+		if (count?.dev && !count.other && findings[index].severity === "HIGH")
+			findings[index] = { ...findings[index], severity: "LOW", message: `${findings[index].message} Only wired up in development code, so it should not reach production.` }
 	}
 	return findings
 }

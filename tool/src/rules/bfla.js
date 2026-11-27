@@ -6,6 +6,8 @@ const PAGE_ONLY = /^(sendFile|render|redirect|download|readFile|createReadStream
 // path segments that name operator-only functions
 const SENSITIVE = /(^|\/)(admin|internal|manage|system|config|debug|metrics|logs?|secrets?|backup)(\/|$)/i
 
+const PUBLIC_PROBE = /\/(public|ping|health\w*|healthz|livez|readyz|version)$/i
+
 // an API key or basic auth is usually issued to operators only; a user login is not
 function sensitiveSeverity(route) {
 	// the handler looks at the caller itself (empty answer for anonymous users), so the gap is narrower
@@ -13,6 +15,8 @@ function sensitiveSeverity(route) {
 	if (/html|page|index|spa|static|view|render/i.test(route.handler)) return "LOW"
 	if (route.middleware.some(m => /api.?(key|auth)|basic/i.test(m))) return "LOW"
 	if (route.fn && dbCalls(route.fn, DB_CALL).length === 0 && dbCalls(route.fn, PAGE_ONLY).length > 0) return "LOW"
+	// Prometheus metrics: operational data to read, not an action to take
+	if (route.method === "GET" && /(^|\/)metrics(\/|$)/i.test(route.path)) return "MEDIUM"
 	return "HIGH"
 }
 
@@ -20,7 +24,8 @@ function sensitiveSeverity(route) {
 export function bfla(route) {
 	if (hasRole(route)) return null
 
-	const sensitive = route.path.match(SENSITIVE)
+	// /system/info/public, /system/ping: a handshake clients call before signing in
+	const sensitive = !(route.method === "GET" || route.method === "HEAD" || /\/ping$/.test(route.path)) || !PUBLIC_PROBE.test(route.path) ? route.path.match(SENSITIVE) : null
 	// a password in the body guards it (a one-time bootstrap, a confirm-with-password step)
 	if (sensitive && route.fn && checksBodyCredential(route.fn)) return null
 	if (sensitive) {

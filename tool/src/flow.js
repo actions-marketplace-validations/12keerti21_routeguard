@@ -1,12 +1,13 @@
 import { walk, isCallNode, isMemberNode } from "./mapper.js"
-import { DB_CALL, DB_WRITE, handlerParams, isMember } from "./rules/handler.js"
+import { DB_CALL, DB_WRITE, decoratedParams, handlerParams, isMember } from "./rules/handler.js"
 
 // a call that takes the caller and decides: canEdit(user, course), assertCourseReach(user, id), findOwnedCourse(id, user)
 const CHECK_FN = /can[A-Z_]|check|assert|ensure|reach|access|permi(t|ssion)|authori[sz]|verify|owned|own[A-Z]|allowed|guard|scope/i
 // an unresolved call that looks like it loads a record: userService.getUserById(id)
 const SERVICE_LOOKUP = /^(get|find|fetch|load|read|update|edit|patch|delete|remove|destroy|archive)[A-Z_]/
 const IDENTITY_KEYS = new Set(["user", "auth", "session", "userId", "currentUser", "principal", "identity", "actor", "accountability", "claims"])
-const IDENTITY_FN = /user|auth|jwt|token|session|identity|principal|caller/i
+// queueScope(req, projectId): a filter built from the request is the caller's
+const IDENTITY_FN = /user|auth|jwt|token|session|identity|principal|caller|scope/i
 const APPENDS_USER = /(append|set|attach|inject|add)_?user/i
 const BODY_USER_FIELD = /^(user_?id|owner_?id|owner)$/i
 const MAX_DEPTH = 4
@@ -207,8 +208,11 @@ export function traceScope(ctx) {
 // start at a route's handler, where req.params are the ids and req.user is the caller
 export function traceRoute(route) {
 	const { req } = handlerParams(route.fn)
+	const { ids, callers } = decoratedParams(route.fn)
 	return traceScope({
 		fn: route.fn,
+		ids,
+		callers,
 		file: route.fnPath,
 		resolve: route.resolve,
 		req,

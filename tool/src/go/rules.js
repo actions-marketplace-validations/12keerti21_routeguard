@@ -53,7 +53,7 @@ const targetOf = arg => (arg?.type === "unary_expression" ? arg.namedChildren[0]
 // API1
 export function bolaGo(route) {
 	if (!/[:{]/.test(route.path) || !route.go.fn || hasRole(route)) return null
-	if (!route.auth && route.method === "GET") return null
+	if (!route.auth && (route.method === "GET" || route.method === "HEAD")) return null
 	const params = route.path.match(/[:{](\w+)/g)?.map(p => p.slice(1)) ?? []
 	if (params.length && params.every(p => SECRET_PARAM.test(p))) return null
 	// /hooks/{id}: an incoming webhook is reached by its unguessable id, which is the credential
@@ -69,7 +69,8 @@ export function bolaGo(route) {
 	return {
 		rule: "BOLA",
 		owasp: !route.auth ? "API1/API2: no auth at all" : write ? "API1:2023 BOLA, or API5:2023 BFLA if this is a shared record only admins should change" : "API1:2023 Broken Object Level Authorization",
-		severity: !route.auth || write ? "HIGH" : "MEDIUM",
+		// a signed-in user who must already know a random UUID: real, but hard to reach
+		severity: !route.auth || (write && !randomIds(route)) ? "HIGH" : "MEDIUM",
 		route: `${route.method} ${route.path}`,
 		where: `${at.file}:${at.line}`,
 		message: `${at.method}${via} uses an id from the URL, and nothing on the way checks it against the caller.`,
@@ -296,3 +297,8 @@ export function ssrfGo(route) {
 }
 
 export const GO_RULES = [bolaGo, bflaGo, massAssignmentGo, dataExposureGo, ssrfGo]
+
+const randomIds = route => {
+	const params = (route.path.match(/[:{<](?:\w+:)?(\w+)/g) ?? []).map(p => p.replace(/^[:{<](\w+:)?/, ""))
+	return params.length > 0 && params.filter(p => RECORD_PARAM.test(p)).every(p => /uuid|guid/i.test(p))
+}

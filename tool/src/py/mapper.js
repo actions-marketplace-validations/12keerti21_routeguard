@@ -376,8 +376,12 @@ export async function mapPyRoutes(root) {
 		seen.add(key)
 		return true
 	})
+	// a urls.py mapped on its own before its parent's include reached it: keep the copy with the prefix
+	const byView = new Map()
+	for (const r of unique) byView.set(`${r.method} ${r.file}:${r.line}`, [...(byView.get(`${r.method} ${r.file}:${r.line}`) ?? []), r.path])
+	const prefixed = unique.filter(r => r.framework !== "django" || !byView.get(`${r.method} ${r.file}:${r.line}`).some(p => p.length > r.path.length && p.endsWith(r.path)))
 	routes.length = 0
-	routes.push(...unique)
+	routes.push(...prefixed)
 	Object.defineProperty(routes, "pyContext", { value: ctx })
 	return routes
 
@@ -671,15 +675,20 @@ export async function mapPyRoutes(root) {
 			done.add(`${file}|${prefix}`)
 			reachable.add(file)
 			collectRouters(file)
-			const patterns = fi.assigns.get("urlpatterns")
 			const lists = []
-			if (patterns) lists.push(patterns)
-			// urlpatterns += [...], urlpatterns += router.urls
+			// urlpatterns = [...], and later urlpatterns = [debug] + urlpatterns or urlpatterns += router.urls
+			// urlpatterns = decorate_urlpatterns(urlpatterns, require_admin_access) wraps every view
+			const wrapped = []
 			walk(fi.tree.rootNode, n => {
+				if (n.type === "assignment" && field(n, "left")?.text === "urlpatterns") {
+					const right = field(n, "right")
+					if (right?.type === "call" && posArgs(right)[0]?.text === "urlpatterns") wrapped.push(...posArgs(right).slice(1).map(textOf))
+					else lists.push(right)
+				}
 				if (n.type === "augmented_assignment" && field(n, "left")?.text === "urlpatterns") lists.push(field(n, "right"))
 				if (n.type === "call" && callName(n) === "extend" && callObject(n)?.text === "urlpatterns") lists.push(posArgs(n)[0])
 			})
-			for (const list of lists) entries(list, file, prefix, mw, anchored, depth)
+			for (const list of lists) entries(list, file, prefix, [...mw, ...wrapped], anchored, depth)
 		}
 		const entries = (list, file, prefix, mw, anchored, depth) => {
 			if (!list || depth > 8) return
@@ -694,6 +703,8 @@ export async function mapPyRoutes(root) {
 				return
 			}
 			if (list.type === "identifier") {
+				// the list itself, already read from each assignment
+				if (list.text === "urlpatterns") return
 				const found = lookup(list.text, file)
 				if (found?.kind === "object" && found.node.id !== list.parent?.id) entries(found.node, found.file, prefix, mw, anchored, depth + 1)
 				return
@@ -797,7 +808,7 @@ export async function mapPyRoutes(root) {
 			for (const action of actionsOf(cls)) {
 				const [method, detail] = ACTION[action]
 				const handler = classMethod(cls, action)
-				add({ method, path: detail ? `${base}/{${lookupKwarg}}` : base, middleware: [...mw, ...guards.names], public: guards.public, handler: `${cls.name}.${action}`, framework: "django", anchored }, handler ?? { cls, generic: action }, handler?.file ?? cls.file, handler ? lineOf(handler.node) : lineOf(cls.node), { cls, action, lookup: lookupKwarg })
+				add({ method, path: detail ? `${base}/{${lookupKwarg}}` : base, middleware: [...mw, ...guards.names, ...(handler ? decoratorsOf(handler.decorated).map(nameOf) : [])], public: guards.public, handler: `${cls.name}.${action}`, framework: "django", anchored }, handler ?? { cls, generic: action }, handler?.file ?? cls.file, handler ? lineOf(handler.node) : lineOf(cls.node), { cls, action, lookup: lookupKwarg })
 			}
 			// @action(detail=True, methods=["post"], url_path="publish")
 			for (const c of lineage(cls)) {
@@ -810,7 +821,7 @@ export async function mapPyRoutes(root) {
 					const extra = items(kwarg(dec, "permission_classes")).map(p => textOf(p).split(".").at(-1))
 					const isPublic = extra.length > 0 && extra.every(n => PUBLIC_PERMISSION.test(n))
 					for (const method of methods.length ? methods : ["GET"])
-						add({ method, path: detail ? `${base}/{${lookupKwarg}}/${urlPath}` : `${base}/${urlPath}`, middleware: [...mw, ...(extra.length ? extra : guards.names)], public: isPublic || (!extra.length && guards.public), handler: `${cls.name}.${name}`, framework: "django", anchored }, m, m.file, lineOf(m.node), { cls, action: name, lookup: lookupKwarg })
+						add({ method, path: detail ? `${base}/{${lookupKwarg}}/${urlPath}` : `${base}/${urlPath}`, middleware: [...mw, ...(extra.length ? extra : guards.names), ...decoratorsOf(m.decorated).filter(d => d !== dec).map(nameOf)], public: isPublic || (!extra.length && guards.public), handler: `${cls.name}.${name}`, framework: "django", anchored }, m, m.file, lineOf(m.node), { cls, action: name, lookup: lookupKwarg })
 				}
 			}
 		}
@@ -830,7 +841,7 @@ export async function mapPyRoutes(root) {
 						const method = pyString(field(pair, "key"))?.toUpperCase()
 						const action = pyString(field(pair, "value"))
 						const handler = action ? classMethod(cls, action) : null
-						if (method) add({ method, path: full, middleware: [...mw, ...guards.names], public: guards.public, handler: `${cls.name}.${action}`, framework: "django", anchored }, handler ?? { cls, generic: action }, handler?.file ?? cls.file, handler ? lineOf(handler.node) : line, { cls, action, lookup: null })
+						if (method) add({ method, path: full, middleware: [...mw, ...guards.names, ...(handler ? decoratorsOf(handler.decorated).map(nameOf) : [])], public: guards.public, handler: `${cls.name}.${action}`, framework: "django", anchored }, handler ?? { cls, generic: action }, handler?.file ?? cls.file, handler ? lineOf(handler.node) : line, { cls, action, lookup: null })
 					}
 					return
 				}

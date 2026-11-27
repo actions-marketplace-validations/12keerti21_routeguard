@@ -60,6 +60,8 @@ node bin/cli.js <path-to-your-api> --fail-on HIGH  # exit 2 only on HIGH finding
 Requires Node 20 or later, and no Go toolchain. It reads:
 
 - **Express**: JavaScript and TypeScript, `require` and `import`, monorepos and package.json `#imports`.
+- **Decorator controllers**: NestJS `@Controller` (with `@UseGuards`, `@Public`, `APP_GUARD` and
+  `setGlobalPrefix`), routing-controllers and n8n's `@RestController`.
 - **Go**: Gin, Echo, Fiber, chi, gorilla/mux, httprouter and `net/http` (including Go 1.22 patterns such
   as `"GET /items/{id}"`). Routers are followed through groups, sub-routers, mounts, routers kept in
   struct fields and routers passed to other packages; middleware is read from `Use`, group arguments,
@@ -213,7 +215,7 @@ Leave out the rule name to silence every rule for that route.
 - Static analysis trusts what a check returns. If `canEdit()` itself has a logic bug, only `verify` against a running app will show it.
 - Probes only see what the sampled routes return: a clean result means none of those leaked, not that no route does.
 - Static analysis cannot know an id is unguessable. Capability links need a `routeguard-ignore` comment.
-- Express, Go and Python only for now. Other Node frameworks (Fastify, NestJS, Koa) get a warning instead of results.
+- Express, decorator controllers, Go and Python only for now. Fastify, Koa and hapi get a warning instead of results.
 - Python routes registered through a project's own routing layer, or added dynamically, may be missed.
 - Go routes registered from data at runtime, or through a project's own routing layer, may be missed or left with an unresolved `<prefix>`.
 

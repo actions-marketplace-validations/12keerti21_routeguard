@@ -23,7 +23,7 @@ export function bolaPy(route) {
 	// the id may come in the body or the query instead: {"id": 5}, ?order_id=5
 	const bodyIds = route.py.fn?.node ? requestIds(route.py.fn.node) : []
 	if ((!/\{\w+\}/.test(route.path) && !bodyIds.length) || hasRole(route)) return null
-	if (!route.auth && route.method === "GET") return null
+	if (!route.auth && (route.method === "GET" || route.method === "HEAD")) return null
 	const params = route.path.match(/\{(\w+)\}/g)?.map(p => p.slice(1, -1)) ?? []
 	if (params.length && params.every(p => SECRET_PARAM.test(p))) return null
 	// /badge/{badge_key}/{signature}: an unguessable key or signature in a public link is its credential
@@ -38,7 +38,8 @@ export function bolaPy(route) {
 	const finding = (at, message) => ({
 		rule: "BOLA",
 		owasp: !route.auth ? "API1/API2: no auth at all" : write ? "API1:2023 BOLA, or API5:2023 BFLA if this is a shared record only admins should change" : "API1:2023 Broken Object Level Authorization",
-		severity: !route.auth || write ? "HIGH" : "MEDIUM",
+		// a signed-in user who must already know a random UUID: real, but hard to reach
+		severity: !route.auth || (write && !randomIds(route)) ? "HIGH" : "MEDIUM",
 		route: `${route.method} ${route.path}`,
 		where: at,
 		message,
@@ -263,9 +264,11 @@ export function ssrfPy(route) {
 	}
 	const hits = []
 	let checked = false
+	const values = new Map()
 	walk(body, n => {
 		if (n.type === "assignment") {
 			const left = field(n, "left")
+			if (left?.type === "identifier" && field(n, "right")) values.set(left.text, field(n, "right"))
 			const input = field(n, "right") && inputOf(field(n, "right"))
 			if (left?.type === "identifier" && input) tainted.set(left.text, input)
 		}
@@ -281,8 +284,17 @@ export function ssrfPy(route) {
 	})
 	if (!hits.length || checked) return null
 	const [hit] = hits
-	const lead = hit.arg.type === "string" ? hit.arg.text.replace(/^[fFrRbB]*['"]/, "") : hit.arg.type === "binary_operator" ? pyString(field(hit.arg, "left")) ?? "" : ""
-	const fixed = FIXED_HOST.test(lead)
+	// url = f"https://api.host/{q}" if q else f"https://api.host/", then requests.get(url)
+	const leadOf = (arg, depth = 0) => {
+		if (!arg || depth > 3) return [""]
+		if (arg.type === "identifier" && values.has(arg.text)) return leadOf(values.get(arg.text), depth + 1)
+		if (arg.type === "parenthesized_expression") return leadOf(arg.namedChildren[0], depth + 1)
+		if (arg.type === "conditional_expression") return [arg.namedChildren[0], arg.namedChildren[2]].flatMap(x => leadOf(x, depth + 1))
+		if (arg.type === "string") return [arg.text.replace(/^[fFrRbB]*['"]/, "")]
+		if (arg.type === "binary_operator") return [pyString(field(arg, "left")) ?? ""]
+		return [""]
+	}
+	const fixed = leadOf(hit.arg).every(lead => FIXED_HOST.test(lead))
 	return {
 		rule: "SSRF",
 		owasp: "API7:2023 Server Side Request Forgery",
@@ -298,3 +310,8 @@ export function ssrfPy(route) {
 }
 
 export const PY_RULES = [bolaPy, bflaPy, massAssignmentPy, dataExposurePy, ssrfPy]
+
+const randomIds = route => {
+	const params = (route.path.match(/[:{<](?:\w+:)?(\w+)/g) ?? []).map(p => p.replace(/^[:{<](\w+:)?/, ""))
+	return params.length > 0 && params.filter(p => RECORD_PARAM.test(p)).every(p => /uuid|guid/i.test(p))
+}

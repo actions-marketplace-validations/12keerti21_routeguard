@@ -166,9 +166,15 @@ export function tracePy(route, requestIds = []) {
 			// require_admin_or_owner(alert.user_id): the check reads the caller itself
 			if (CHECK_FN.test(topName) && (hasId || hasRecord) && /owner|access|perm|admin|member/i.test(topName)) result.guarded = true
 			if (/check_object_permissions|has_object_permission/.test(topName)) result.guarded = true
+			// if not ProjectMember.objects.filter(member=request.user, project_id=pk).exists(): a membership check
+			if (topName === "exists" && hasId && hasCaller) result.guarded = true
 			if (CALLER_ACTION.test(topName) && hasCaller && !isIdentity(top)) result.callerAction = true
 			if (/^(create|insert|insert_one|add|bulk_create|save)$|^(create|insert|add)_/.test(topName)) result.creates = true
-			if (!hasId) return
+			// UpdateActionType.do(request.user, integration): the record and the caller go on together, so follow them
+			// bookmark_read(request, asset.bookmark_id): the whole request carries the caller in
+			const passesRequest = (field(top, "arguments")?.namedChildren ?? []).some(a => a.type === "identifier" && /^(request|req)$/.test(a.text))
+			const handsOn = !hasId && hasRecord && (hasCaller || passesRequest)
+			if (!hasId && !handsOn) return
 			if (LOG_CALL.test(topName)) return
 			const receiver = field(top, "function")?.text ?? ""
 			const isDb = (DB_METHOD.test(topName) && DB_RECEIVER.test(receiver)) || DB_FN.test(topName)
@@ -177,8 +183,16 @@ export function tracePy(route, requestIds = []) {
 			if (/self\.queryset|self\.get_queryset\(\)/.test(top.text) && querysetScoped(owner, ctx)) return
 			// the owner in the same query: filter(id=pk, user=request.user), where(Item.owner_id == user.id)
 			const ownerInQuery = hasCaller || (OWNER_WORD.test(top.text) && has(top, "caller"))
+			// filter(id=pk, owner=user) reads the id; filter_by(username=resp["sub"]) only names a field like it
+			let idValue = false
+			if (hasId)
+				walk(top, a => {
+					if (a.type === "argument_list" && a.namedChildren.some(arg => has(arg.type === "keyword_argument" ? field(arg, "value") : arg, "id"))) idValue = true
+				})
+			// Bookmark.objects.get(pk=asset.bookmark_id, owner=request.user): the loaded record's parent, re-read as the caller's
+			if (isDb && hasRecord && !hasId && ownerInQuery && /^(get|get_object_or_404|first_or_404|one|get_or_404)$/.test(topName)) result.guarded = true
 			if (isDb) {
-				result.sinks.push({ method: topName, line: lineOf(top), file, chain, scoped: ownerInQuery })
+				result.sinks.push({ method: topName, line: lineOf(top), file, chain, scoped: ownerInQuery, withId: idValue })
 				return
 			}
 			const targets = depth < DEPTH ? resolve(top, file, owner) : []
@@ -207,9 +221,12 @@ export function tracePy(route, requestIds = []) {
 				}
 				return
 			}
+			// a service we cannot open that gets the caller with the record or id is trusted to check them, as a caller action is
+			if (hasCaller && !isIdentity(top) && !/render|jsonify|response|serializ|dump|format|template|print|log/i.test(topName)) result.callerAction = true
+			if (handsOn) return
 			if (RECORD_SERVICE.test(topName) || DB_METHOD.test(topName)) {
 				if (DB_METHOD.test(topName) && !DB_RECEIVER.test(receiver) && !RECORD_SERVICE.test(topName)) return
-				result.sinks.push({ method: topName, line: lineOf(top), file, chain, scoped: ownerInQuery })
+				result.sinks.push({ method: topName, line: lineOf(top), file, chain, scoped: ownerInQuery, withId: idValue })
 			}
 		})
 		return result
@@ -224,7 +241,9 @@ export function tracePy(route, requestIds = []) {
 	const result = analyse(fn.node, fn.file, { id: new Set(ids), record: new Set(), caller: new Set(callers) }, 0, [], owner)
 	if (result.guarded) return { scoped: true }
 	let open = result.sinks.filter(s => !s.scoped)
-	if ((result.callerAction || (route.method === "POST" && result.creates)) && open.every(s => READ_SINK.test(s.method))) open = []
+	// a write scoped to the caller, after reading a parent by another id (the published board, the project)
+	const ownedWrite = !["GET", "HEAD"].includes(route.method) && result.sinks.some(s => s.scoped && s.withId)
+	if ((result.callerAction || ownedWrite || (route.method === "POST" && result.creates)) && open.every(s => READ_SINK.test(s.method))) open = []
 	if (open.length === 0) return { scoped: result.sinks.length ? true : null }
 	if (result.unknown) return { scoped: null, unknown: true }
 	const at = open[0]

@@ -22,12 +22,38 @@ export const isMember = (node, objectName, propertyName) =>
 	node.object.name === objectName &&
 	(propertyName === undefined || node.property.name === propertyName)
 
+const decoratorName = d => {
+	const e = d.expression
+	return (e.type === "CallExpression" ? e.callee.name ?? e.callee.property?.name : e.name ?? e.property?.name) ?? ""
+}
+
+// get(@Param("id") id, @Req() req, @CurrentUser() user): the decorator says what each parameter is
+export function decoratedParams(fn) {
+	const out = { ids: new Set(), callers: new Set(), req: null, res: null, plain: [] }
+	for (const param of fn?.params ?? []) {
+		const node = param.type === "TSParameterProperty" ? param.parameter : param
+		const name = node.type === "Identifier" ? node.name : node.left?.name
+		const kinds = (node.decorators ?? []).map(decoratorName)
+		if (!kinds.length) {
+			out.plain.push(name)
+			continue
+		}
+		if (!name) continue
+		if (kinds.some(k => /^Params?$/.test(k))) out.ids.add(name)
+		else if (kinds.some(k => /^Req(uest)?$/.test(k))) out.req = name
+		else if (kinds.some(k => /^Res(ponse)?$/.test(k))) out.res = name
+		else if (kinds.some(k => /user|auth|session|principal|caller|account/i.test(k))) out.callers.add(name)
+	}
+	return out
+}
+
 // the names the handler gives req and res: (request, response) => {} works too
 export function handlerParams(fn) {
-	const [reqParam, resParam] = fn.params
+	const decorated = decoratedParams(fn)
+	const [reqParam, resParam] = decorated.plain.length < fn.params.length ? decorated.plain : fn.params.map(p => (p.type === "Identifier" ? p.name : null))
 	return {
-		req: reqParam?.type === "Identifier" ? reqParam.name : "req",
-		res: resParam?.type === "Identifier" ? resParam.name : "res"
+		req: decorated.req ?? reqParam ?? "req",
+		res: decorated.res ?? resParam ?? "res"
 	}
 }
 
@@ -58,7 +84,7 @@ const BODY_USER_FIELD = /^(user_?id|owner_?id|owner)$/i
 
 function identity(fn, route) {
 	const { req, res } = handlerParams(fn)
-	const names = new Set()
+	const names = new Set(decoratedParams(fn).callers)
 	const bodyIsCaller = route?.middleware.some(m => APPENDS_USER.test(m)) ?? false
 	const isIdentity = n =>
 		(isMember(n, req) && IDENTITY_KEYS.has(n.property.name)) ||

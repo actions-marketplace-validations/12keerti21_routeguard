@@ -35,7 +35,8 @@ export function inventory(routes, root) {
 			findings.push({
 				rule: "SHADOW_ROUTE",
 				owasp: "API9:2023 Improper Inventory Management",
-				severity: "HIGH",
+				// a signed-in copy may scope records itself (a session API next to an API-key one)
+				severity: weaker.auth ? "MEDIUM" : "HIGH",
 				route: `${weaker.method} ${weaker.path}`,
 				where: `${weaker.file}:${weaker.line}`,
 				message: `Another copy of this endpoint (${strongest.file}:${strongest.line}) requires ${STRENGTH[strength(strongest)]}; this one requires ${STRENGTH[strength(weaker)]}, so callers can go around the check.`,

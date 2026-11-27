@@ -75,21 +75,27 @@ export function goAppRules(routes) {
 			// w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
 			if (/^(Set|Add|Header)$/.test(name) && /Access-Control-Allow-Origin/.test(a[0]?.text ?? "")) {
 				const value = a[1]?.text ?? ""
-				const reflected = /Origin/i.test(value) && !/^"/.test(value)
+				// r.Header.Get("Origin") or a local origin read from it; conf.CORS.AllowOrigin is configuration
+				const reflected = /Header\.Get\(\s*"Origin"|^origin$/i.test(value)
 				if (reflected || value === '"*"') {
 					// credentials sent only after an allow-list check do not count
 					let credentials = false
 					walk(enclosingFunction(n), c => {
 						if (c.type === "call_expression" && /Access-Control-Allow-Credentials"\s*,\s*"true"/.test(c.text) && !allowListed(c)) credentials = true
 					})
-					findings.push(finding("CORS", "API8:2023 Security Misconfiguration", credentials ? "HIGH" : "LOW", at(file, n), `Access-Control-Allow-Origin is ${reflected ? "copied from the request" : "*"}${credentials ? ", with Allow-Credentials true, so any website can act as the signed-in user" : ""}.`, "Compare the Origin against an allow-list before echoing it."))
+					findings.push(finding("CORS", "API8:2023 Security Misconfiguration", credentials && reflected ? "HIGH" : "LOW", at(file, n), `Access-Control-Allow-Origin is ${reflected ? "copied from the request" : "*"}${credentials ? (reflected ? ", with Allow-Credentials true, so any website can act as the signed-in user" : ", with Allow-Credentials true, which browsers refuse; drop one of the two") : ""}.`, "Compare the Origin against an allow-list before echoing it."))
 				}
 			}
 			// JWT
 			if (/UnsafeAllowNoneSignatureType|SigningMethodNone/.test(n.text) && /^(Parse|ParseWithClaims|SignedString|New|NewWithClaims)$/.test(name))
 				findings.push(finding("JWT", "API2:2023 Broken Authentication", "HIGH", at(file, n), "The none algorithm is allowed, so an unsigned token passes.", "Never use SigningMethodNone or UnsafeAllowNoneSignatureType."))
-			if (name === "ParseUnverified")
-				findings.push(finding("JWT", "API2:2023 Broken Authentication", "MEDIUM", at(file, n), "jwt.ParseUnverified() reads a token without checking its signature; any claim read from it can be forged.", "Use jwt.Parse with a key, and read unverified claims only to pick that key."))
+			if (name === "ParseUnverified") {
+				// reading the kid to pick a key, then verifying; an id_token straight from the provider's token endpoint; or a helper named for what it does
+				const fn = enclosingFunction(n)
+				const fnName = fn?.childForFieldName("name")?.text ?? ""
+				const verifies = /\b(Parse|ParseWithClaims|Verify\w*|Validate\w*Signature)\(|\bkid\b|oauth2\.Token|Extra\("id_token"\)/.test(fn?.text ?? "") || /Unverified/i.test(fnName)
+				findings.push(finding("JWT", "API2:2023 Broken Authentication", verifies ? "LOW" : "MEDIUM", at(file, n), `jwt.ParseUnverified() reads a token without checking its signature; any claim read from it can be forged.${verifies ? " Here it looks like a step before verification." : ""}`, "Use jwt.Parse with a key, and read unverified claims only to pick that key."))
+			}
 			if (name === "WithoutClaimsValidation")
 				findings.push(finding("JWT", "API2:2023 Broken Authentication", "MEDIUM", at(file, n), "Token claims are not validated, so an expired token still works.", "Remove jwt.WithoutClaimsValidation()."))
 			if (name === "SignedString" && hardcoded(a[0]))

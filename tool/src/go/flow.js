@@ -58,6 +58,8 @@ export function traceGo(route) {
 		const state = { id: new Set(taint.id), record: new Set(taint.record), caller: new Set(taint.caller), carriers: new Set(taint.carriers), vars: new Set() }
 		const local = { types: new Map(), funcs: new Map() }
 		for (const p of paramsOf(fnNode)) if (p.name) local.types.set(p.name, p.type.replace(/^[*&]/, "").split(".").at(-1))
+		const receiver = field(fnNode, "receiver")
+		if (receiver) for (const p of paramsOf({ childForFieldName: k => (k === "parameters" ? receiver : null) })) if (p.name) local.types.set(p.name, p.type.replace(/^[*&]/, "").split(".").at(-1))
 
 		const has = (node, kind) => {
 			let found = false
@@ -143,7 +145,7 @@ export function traceGo(route) {
 			if (/^(Create|Insert|InsertOne|Save|SaveOne|CreateInBatches)$|^(Create|Insert|Add)[A-Z]/.test(name)) result.creates = true
 			if (!hasId) return
 			const sqlScoped = args(top).some(a => OWNER_SQL.test(stringValue(a) ?? "")) && hasCaller
-			if (DB_CALL.test(name) && n === top) {
+			if (DB_CALL.test(name) && n === top && !(depth < DEPTH && ctx.resolveTyped(n, local, file).length)) {
 				result.sinks.push({ method: name, line: lineOf(n), file, chain, scoped: hasCaller || sqlScoped })
 				// db.First(&order, id): order now holds the record
 				for (const a of args(n)) if (a.type === "unary_expression") state.record.add(a.namedChildren[0].text)

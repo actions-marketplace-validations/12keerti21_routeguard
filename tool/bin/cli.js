@@ -81,8 +81,10 @@ const jsRoutes = mapRoutes(path.resolve(target))
 const goRoutes = await mapGoRoutes(path.resolve(target))
 const pyRoutes = await mapPyRoutes(path.resolve(target))
 const routes = [...jsRoutes, ...goRoutes, ...pyRoutes]
-const other = Object.entries(jsRoutes.frameworks).filter(([f]) => f !== "express").sort((a, b) => b[1] - a[1])
-if (goRoutes.length === 0 && pyRoutes.length === 0 && other.length && other[0][1] > (jsRoutes.frameworks.express ?? 0))
+// NestJS services and modules import @nestjs too; its controllers are read as decorator routes
+const other = Object.entries(jsRoutes.frameworks).filter(([f]) => f !== "express" && f !== "decorators" && !(f === "nestjs" && jsRoutes.frameworks.decorators)).sort((a, b) => b[1] - a[1])
+const readable = (jsRoutes.frameworks.express ?? 0) + (jsRoutes.frameworks.decorators ?? 0)
+if (goRoutes.length === 0 && pyRoutes.length === 0 && other.length && other[0][1] > readable)
 	console.error(`warning: this looks like a ${other[0][0]} app (${other[0][1]} files, ${jsRoutes.frameworks.express ?? 0} using Express). routeguard reads Express, Go and Python routes only, so these results are unreliable.`)
 const suppressed = (route, finding) => route.ignored === "all" || route.ignored?.has(finding.rule)
 // a router mounted twice reports the same code twice
